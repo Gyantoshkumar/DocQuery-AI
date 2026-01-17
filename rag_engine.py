@@ -2,6 +2,7 @@
 DocQuery-AI: RAG Engine
 ========================
 Core RAG (Retrieval Augmented Generation) pipeline using LangChain and Google Gemini.
+Refactored to use simpler approach for Python 3.14 compatibility.
 """
 
 import os
@@ -12,15 +13,16 @@ import hashlib
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-from langchain.prompts import PromptTemplate
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
 
 
 class RAGEngine:
     """
     RAG Engine for processing PDFs and answering questions using Google Gemini.
+    Uses simple LCEL chains for Python 3.14 compatibility.
     """
     
     def __init__(self, google_api_key: str):
@@ -43,8 +45,7 @@ class RAGEngine:
         self.llm = ChatGoogleGenerativeAI(
             model="gemini-1.5-flash",
             google_api_key=google_api_key,
-            temperature=0.3,
-            convert_system_message_to_human=True
+            temperature=0.3
         )
         
         # Text splitter for chunking documents
@@ -55,15 +56,29 @@ class RAGEngine:
             separators=["\n\n", "\n", " ", ""]
         )
         
-        # Vector store and chain (initialized when documents are loaded)
-        self.vector_store: Optional[Chroma] = None
-        self.qa_chain = None
-        self.memory = None
+        # Vector store (initialized when documents are loaded)
+        self.vector_store: Optional[FAISS] = None
         self.processed_files: List[str] = []
+        self.chat_history: List[Tuple[str, str]] = []
         
     def _get_file_hash(self, file_content: bytes) -> str:
         """Generate a hash for file content to track processed files."""
         return hashlib.md5(file_content).hexdigest()
+    
+    def _format_docs(self, docs) -> str:
+        """Format retrieved documents into a string."""
+        return "\n\n".join(doc.page_content for doc in docs)
+    
+    def _format_chat_history(self) -> str:
+        """Format chat history into a string."""
+        if not self.chat_history:
+            return "No previous conversation."
+        
+        formatted = []
+        for human, ai in self.chat_history[-5:]:  # Keep last 5 exchanges
+            formatted.append(f"Human: {human}")
+            formatted.append(f"Assistant: {ai}")
+        return "\n".join(formatted)
     
     def process_pdfs(self, pdf_files: List[Tuple[str, bytes]]) -> Tuple[bool, str]:
         """
@@ -107,55 +122,13 @@ class RAGEngine:
             chunks = self.text_splitter.split_documents(all_documents)
             
             # Create vector store
-            self.vector_store = Chroma.from_documents(
+            self.vector_store = FAISS.from_documents(
                 documents=chunks,
-                embedding=self.embeddings,
-                collection_name="docquery_collection"
+                embedding=self.embeddings
             )
             
-            # Initialize conversation memory
-            self.memory = ConversationBufferMemory(
-                memory_key="chat_history",
-                return_messages=True,
-                output_key="answer"
-            )
-            
-            # Create custom prompt
-            qa_prompt = PromptTemplate(
-                template="""You are DocQuery-AI, an intelligent document assistant. Your role is to help users understand and extract information from their uploaded documents.
-
-INSTRUCTIONS:
-- Answer questions based ONLY on the provided context from the documents
-- If the answer is not in the documents, clearly state that
-- Be concise but comprehensive
-- Use bullet points for lists
-- Quote relevant passages when appropriate
-- Always be helpful and professional
-
-CONTEXT FROM DOCUMENTS:
-{context}
-
-CHAT HISTORY:
-{chat_history}
-
-USER QUESTION: {question}
-
-DOCQUERY-AI RESPONSE:""",
-                input_variables=["context", "chat_history", "question"]
-            )
-            
-            # Create QA chain
-            self.qa_chain = ConversationalRetrievalChain.from_llm(
-                llm=self.llm,
-                retriever=self.vector_store.as_retriever(
-                    search_type="similarity",
-                    search_kwargs={"k": 4}
-                ),
-                memory=self.memory,
-                return_source_documents=True,
-                combine_docs_chain_kwargs={"prompt": qa_prompt},
-                verbose=False
-            )
+            # Clear chat history for new documents
+            self.chat_history = []
             
             total_chunks = len(chunks)
             return True, f"✅ Successfully processed {len(pdf_files)} PDF(s) with {total_chunks} text chunks."
@@ -173,21 +146,60 @@ DOCQUERY-AI RESPONSE:""",
         Returns:
             Tuple of (answer, source_documents)
         """
-        if not self.qa_chain:
+        if not self.vector_store:
             return "Please upload PDF documents first before asking questions.", []
         
         try:
-            # Get response from chain
-            response = self.qa_chain.invoke({"question": question})
+            # Get retriever
+            retriever = self.vector_store.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": 4}
+            )
             
-            answer = response.get("answer", "I couldn't generate an answer.")
-            source_docs = response.get("source_documents", [])
+            # Retrieve relevant documents
+            docs = retriever.invoke(question)
+            context = self._format_docs(docs)
+            chat_history = self._format_chat_history()
+            
+            # Create prompt
+            prompt = ChatPromptTemplate.from_template("""You are DocQuery-AI, an intelligent document assistant. Your role is to help users understand and extract information from their uploaded documents.
+
+INSTRUCTIONS:
+- Answer questions based ONLY on the provided context from the documents
+- If the answer is not in the documents, clearly state that
+- Be concise but comprehensive
+- Use bullet points for lists
+- Quote relevant passages when appropriate
+- Always be helpful and professional
+
+CONTEXT FROM DOCUMENTS:
+{context}
+
+PREVIOUS CONVERSATION:
+{chat_history}
+
+USER QUESTION: {question}
+
+DOCQUERY-AI RESPONSE:""")
+            
+            # Create simple chain using LCEL
+            chain = prompt | self.llm | StrOutputParser()
+            
+            # Get response
+            answer = chain.invoke({
+                "context": context,
+                "chat_history": chat_history,
+                "question": question
+            })
+            
+            # Update chat history
+            self.chat_history.append((question, answer))
             
             # Format source documents
             sources = []
             seen_contents = set()
             
-            for doc in source_docs:
+            for doc in docs:
                 content = doc.page_content[:300]  # Truncate for display
                 content_hash = hash(content)
                 
@@ -206,15 +218,13 @@ DOCQUERY-AI RESPONSE:""",
     
     def clear_memory(self):
         """Clear conversation history."""
-        if self.memory:
-            self.memory.clear()
+        self.chat_history = []
     
     def reset(self):
         """Reset the engine, clearing all loaded documents and memory."""
         self.vector_store = None
-        self.qa_chain = None
-        self.memory = None
         self.processed_files = []
+        self.chat_history = []
 
 
 def validate_api_key(api_key: str) -> Tuple[bool, str]:
