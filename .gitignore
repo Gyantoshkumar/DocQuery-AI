@@ -32,6 +32,7 @@ env/
 # ChromaDB local storage
 chroma_db/
 .chroma/
+faiss_index/
 
 # IDE
 .idea/
